@@ -370,11 +370,13 @@ func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
 			d.infos = append(d.infos, fileInfo(file))
 		}
 	}
-	if d.pos >= len(d.infos) {
-		return nil, io.EOF
-	}
 	if count <= 0 {
+		if d.pos >= len(d.infos) {
+			return nil, nil
+		}
 		count = len(d.infos) - d.pos
+	} else if d.pos >= len(d.infos) {
+		return nil, io.EOF
 	}
 	end := d.pos + count
 	if end > len(d.infos) {

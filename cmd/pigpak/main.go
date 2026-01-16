@@ -30,7 +30,7 @@ func main() {
 	}
 	defer store.Close()
 
-	tg := telegram.NewClient(cfg.BotToken, cfg.TelegramAPIURL)
+	tg := telegram.NewClient(cfg.BotToken, cfg.TelegramAPIURL, cfg.TelegramHTTPTimeout)
 	botRunner := bot.New(cfg, store, tg)
 
 	ctx, cancel := context.WithCancel(context.Background())

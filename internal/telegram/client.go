@@ -21,12 +21,15 @@ type Client struct {
 }
 
 // NewClient creates a Telegram client.
-func NewClient(token, apiURL string) *Client {
+func NewClient(token, apiURL string, timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = 40 * time.Second
+	}
 	return &Client{
 		Token:  token,
 		APIURL: apiURL,
 		HTTP: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
@@ -344,13 +347,28 @@ func (c *Client) DownloadFile(ctx context.Context, filePath string, offset int64
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, err := c.HTTP.Do(req)
+	client := c.HTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if client.Timeout != 0 {
+		clone := *client
+		clone.Timeout = 0
+		client = &clone
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
 		resp.Body.Close()
 		return nil, fmt.Errorf("telegram file download status: %s", resp.Status)
+	}
+	if offset > 0 && resp.StatusCode == http.StatusOK {
+		if _, err := io.CopyN(io.Discard, resp.Body, offset); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
 	}
 	return resp.Body, nil
 }

@@ -20,6 +20,7 @@ type Config struct {
 	PollTimeout     time.Duration
 	PageSize        int
 	MaxPartSizeBytes int64
+	TelegramHTTPTimeout time.Duration
 	WebDAVEnable    bool
 	WebDAVAddr      string
 	WebDAVPublicURL string
@@ -52,6 +53,13 @@ func Load() (Config, error) {
 	cfg.MaxPartSizeBytes = parseInt64("MAX_PART_SIZE_BYTES", 1900*1024*1024)
 	if cfg.MaxPartSizeBytes <= 0 {
 		cfg.MaxPartSizeBytes = 1900 * 1024 * 1024
+	}
+	cfg.TelegramHTTPTimeout = parseDuration("TELEGRAM_HTTP_TIMEOUT", 0)
+	if cfg.TelegramHTTPTimeout <= 0 {
+		cfg.TelegramHTTPTimeout = cfg.PollTimeout + 10*time.Second
+		if cfg.TelegramHTTPTimeout < 20*time.Second {
+			cfg.TelegramHTTPTimeout = 20 * time.Second
+		}
 	}
 
 	cfg.WebDAVEnable = parseBool("WEB_DAV_ENABLE", false)
