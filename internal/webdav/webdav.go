@@ -306,7 +306,11 @@ func (fi davFileInfo) IsDir() bool        { return fi.isDir }
 func (fi davFileInfo) Sys() any           { return nil }
 
 func dirInfo(dir db.Directory) os.FileInfo {
-	return davFileInfo{name: dir.Name, size: 0, mode: os.ModeDir | 0o755, modTime: dir.UpdatedAt, isDir: true}
+	name := dir.Name
+	if !dir.ParentID.Valid {
+		name = ""
+	}
+	return davFileInfo{name: name, size: 0, mode: os.ModeDir | 0o755, modTime: dir.UpdatedAt, isDir: true}
 }
 
 func fileInfo(file db.File) os.FileInfo {
@@ -597,6 +601,9 @@ type uploadFile struct {
 	mimeType      string
 	current       *uploadPart
 	closed        bool
+	aborted       bool
+	abortErr      error
+	doneCh        chan struct{}
 	mu            sync.Mutex
 }
 
@@ -616,7 +623,7 @@ func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ow
 	if maxPartSize <= 0 {
 		maxPartSize = 1900 * 1024 * 1024
 	}
-	return &uploadFile{
+	f := &uploadFile{
 		ctx:           ctx,
 		tg:            tg,
 		store:         store,
@@ -626,25 +633,41 @@ func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ow
 		name:          name,
 		existing:      existing,
 		maxPartSize:   maxPartSize,
+		doneCh:        make(chan struct{}),
 	}
+	go f.watchContext()
+	return f
 }
 
 func (f *uploadFile) Write(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.closed {
-		return 0, errors.New("upload already closed")
-	}
 	written := 0
 	for len(p) > 0 {
+		f.mu.Lock()
+		if f.closed {
+			f.mu.Unlock()
+			return written, errors.New("upload already closed")
+		}
+		if err := f.ctx.Err(); err != nil {
+			f.abortLocked(err)
+		}
+		if f.aborted {
+			err := f.abortErr
+			f.mu.Unlock()
+			if err == nil {
+				err = errors.New("upload canceled")
+			}
+			return written, err
+		}
 		if f.current == nil {
 			if err := f.startPartLocked(); err != nil {
+				f.mu.Unlock()
 				return written, err
 			}
 		}
 		remaining := f.maxPartSize - f.current.size
 		if remaining <= 0 {
-			if err := f.finishPartLocked(); err != nil {
+			f.mu.Unlock()
+			if err := f.finishPart(); err != nil {
 				return written, err
 			}
 			continue
@@ -653,16 +676,34 @@ func (f *uploadFile) Write(p []byte) (int, error) {
 		if toWrite > remaining {
 			toWrite = remaining
 		}
-		n, err := f.current.pipeW.Write(p[:int(toWrite)])
-		f.current.size += int64(n)
+		pipeW := f.current.pipeW
+		f.mu.Unlock()
+
+		n, err := pipeW.Write(p[:int(toWrite)])
+		f.mu.Lock()
+		if f.aborted {
+			abortErr := f.abortErr
+			f.mu.Unlock()
+			if abortErr == nil {
+				abortErr = errors.New("upload canceled")
+			}
+			return written + n, abortErr
+		}
+		if f.current != nil {
+			f.current.size += int64(n)
+		}
 		f.totalSize += int64(n)
+		f.mu.Unlock()
 		written += n
 		p = p[n:]
 		if err != nil {
 			return written, err
 		}
-		if f.current.size >= f.maxPartSize {
-			if err := f.finishPartLocked(); err != nil {
+		f.mu.Lock()
+		needFinish := f.current != nil && f.current.size >= f.maxPartSize
+		f.mu.Unlock()
+		if needFinish {
+			if err := f.finishPart(); err != nil {
 				return written, err
 			}
 		}
@@ -677,17 +718,31 @@ func (f *uploadFile) Close() error {
 		return nil
 	}
 	f.closed = true
-	if f.current != nil {
-		if err := f.finishPartLocked(); err != nil {
-			f.mu.Unlock()
-			return err
+	if f.aborted {
+		err := f.abortErr
+		close(f.doneCh)
+		f.mu.Unlock()
+		if err == nil {
+			err = errors.New("upload canceled")
 		}
+		return err
 	}
+	f.mu.Unlock()
+
+	if err := f.finishPart(); err != nil {
+		f.mu.Lock()
+		close(f.doneCh)
+		f.mu.Unlock()
+		return err
+	}
+
+	f.mu.Lock()
 	parts := append([]db.FilePartInput(nil), f.parts...)
 	totalSize := f.totalSize
 	mimeType := f.mimeType
 	name := f.name
 	existing := f.existing
+	close(f.doneCh)
 	f.mu.Unlock()
 
 	if len(parts) == 0 {
@@ -722,6 +777,13 @@ func (f *uploadFile) Readdir(count int) ([]os.FileInfo, error) {
 }
 
 func (f *uploadFile) startPartLocked() error {
+	if f.aborted {
+		return f.abortErr
+	}
+	if err := f.ctx.Err(); err != nil {
+		f.abortLocked(err)
+		return err
+	}
 	pr, pw := io.Pipe()
 	partIndex := f.partIndex
 	filename := f.partFilename(partIndex)
@@ -738,25 +800,36 @@ func (f *uploadFile) startPartLocked() error {
 	return nil
 }
 
-func (f *uploadFile) finishPartLocked() error {
-	if f.current == nil {
+func (f *uploadFile) finishPart() error {
+	f.mu.Lock()
+	part := f.current
+	f.mu.Unlock()
+	if part == nil {
 		return nil
 	}
-	_ = f.current.pipeW.Close()
-	res := <-f.current.done
+	_ = part.pipeW.Close()
+	res := <-part.done
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.current == part {
+		f.current = nil
+	}
 	if res.err != nil {
+		f.abortLocked(res.err)
 		return res.err
 	}
 	if res.msg == nil || res.msg.Document == nil {
-		return errors.New("telegram upload returned no document")
+		err := errors.New("telegram upload returned no document")
+		f.abortLocked(err)
+		return err
 	}
 	doc := res.msg.Document
 	size := doc.FileSize
 	if size == 0 {
-		size = f.current.size
+		size = part.size
 	}
 	f.parts = append(f.parts, db.FilePartInput{
-		PartIndex:      f.current.index,
+		PartIndex:      part.index,
 		TelegramFileID: doc.FileID,
 		FileUniqueID:   doc.FileUniqueID,
 		Size:           size,
@@ -765,7 +838,6 @@ func (f *uploadFile) finishPartLocked() error {
 		f.mimeType = doc.MimeType
 	}
 	f.partIndex++
-	f.current = nil
 	return nil
 }
 
@@ -774,4 +846,30 @@ func (f *uploadFile) partFilename(index int) string {
 		return f.name
 	}
 	return fmt.Sprintf("%s.part%03d", f.name, index+1)
+}
+
+func (f *uploadFile) watchContext() {
+	select {
+	case <-f.ctx.Done():
+		f.mu.Lock()
+		if !f.closed {
+			f.abortLocked(f.ctx.Err())
+		}
+		f.mu.Unlock()
+	case <-f.doneCh:
+	}
+}
+
+func (f *uploadFile) abortLocked(err error) {
+	if f.aborted {
+		return
+	}
+	f.aborted = true
+	if err == nil {
+		err = errors.New("upload canceled")
+	}
+	f.abortErr = err
+	if f.current != nil {
+		_ = f.current.pipeW.CloseWithError(err)
+	}
 }

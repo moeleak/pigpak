@@ -2,8 +2,9 @@ version: "3.9"
 
 services:
   pigpak:
-    image: pigpak
+    image: tg-bot
     build: .
+    container_name: pigpak
     env_file: .env
     environment:
       - DATA_DIR=/data
@@ -18,6 +19,7 @@ services:
 
   caddy:
     image: caddy:2
+    container_name: caddy
     restart: unless-stopped
     ports:
       - "80:80"
