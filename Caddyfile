@@ -1,0 +1,7 @@
+{
+	email {$CADDY_EMAIL}
+}
+
+{$CADDY_DOMAIN} {
+	reverse_proxy pigpak:8081
+}

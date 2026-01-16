@@ -2,8 +2,9 @@ package webdav
 
 import (
 	"context"
-	"crypto/subtle"
+	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -28,24 +29,23 @@ type Server struct {
 
 // NewServer creates a WebDAV server.
 func NewServer(cfg config.Config, store *db.Store, tg *telegram.Client) (*Server, error) {
-	if cfg.WebDAVOwnerID == 0 {
-		return nil, errors.New("WEB_DAV_OWNER_ID or STORAGE_CHAT_ID must be set for WebDAV")
-	}
 	return &Server{cfg: cfg, store: store, tg: tg}, nil
 }
 
 // Handler builds the WebDAV handler.
 func (s *Server) Handler() http.Handler {
-	fs := &davFS{store: s.store, tg: s.tg, ownerID: s.cfg.WebDAVOwnerID, storageChatID: s.cfg.StorageChatID}
+	fs := &davFS{
+		store:         s.store,
+		tg:            s.tg,
+		storageChatID: s.cfg.StorageChatID,
+		maxPartSize:   s.cfg.MaxPartSizeBytes,
+	}
 	h := &webdav.Handler{
 		Prefix:     "/",
 		FileSystem: fs,
 		LockSystem: webdav.NewMemLS(),
 	}
-	if s.cfg.WebDAVUser == "" || s.cfg.WebDAVPassword == "" {
-		return h
-	}
-	return basicAuth(h, s.cfg.WebDAVUser, s.cfg.WebDAVPassword)
+	return s.wrapAuth(h)
 }
 
 // ListenAndServe starts the WebDAV server.
@@ -58,49 +58,92 @@ func (s *Server) ListenAndServe() error {
 	return server.ListenAndServe()
 }
 
-func basicAuth(next http.Handler, user, pass string) http.Handler {
+func (s *Server) wrapAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, p, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(user)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(pass)) != 1 {
+		username, password, ok := r.BasicAuth()
+		if !ok || username == "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="webdav"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		userID, err := s.store.GetUserIDByUsername(r.Context(), username)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				w.Header().Set("WWW-Authenticate", `Basic realm="webdav"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		ok, err = s.store.VerifyWebDAVPassword(r.Context(), userID, password)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="webdav"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), webdavUserKey{}, userID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 type davFS struct {
 	store         *db.Store
 	tg            *telegram.Client
-	ownerID       int64
 	storageChatID int64
+	maxPartSize   int64
+}
+
+type webdavUserKey struct{}
+
+func (fs *davFS) userID(ctx context.Context) (int64, error) {
+	val := ctx.Value(webdavUserKey{})
+	if val == nil {
+		return 0, errors.New("missing webdav user")
+	}
+	userID, ok := val.(int64)
+	if !ok || userID == 0 {
+		return 0, errors.New("invalid webdav user")
+	}
+	return userID, nil
 }
 
 func (fs *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+	userID, err := fs.userID(ctx)
+	if err != nil {
+		return err
+	}
 	parentParts, base := splitPath(name)
 	if base == "" {
 		return nil
 	}
-	parentDir, err := fs.store.FindDirByPath(ctx, fs.ownerID, parentParts)
+	parentDir, err := fs.store.FindDirByPath(ctx, userID, parentParts)
 	if err != nil {
 		return err
 	}
-	_, err = fs.store.CreateDir(ctx, fs.ownerID, parentDir.ID, base)
+	_, err = fs.store.CreateDir(ctx, userID, parentDir.ID, base)
 	return err
 }
 
 func (fs *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
+	userID, err := fs.userID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if name == "." {
 		name = "/"
 	}
-	entry, err := fs.resolve(ctx, name)
+	entry, err := fs.resolve(ctx, userID, name)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 		if flag&(os.O_CREATE|os.O_WRONLY|os.O_RDWR) != 0 {
-			return fs.createUploadFile(ctx, name, flag)
+			return fs.createUploadFile(ctx, userID, name, flag)
 		}
 		return nil, err
 	}
@@ -108,28 +151,40 @@ func (fs *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fi
 		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0 {
 			return nil, errors.New("cannot write to directory")
 		}
-		return newDirFile(ctx, fs.store, fs.ownerID, entry.dir.ID), nil
+		return newDirFile(ctx, fs.store, userID, entry.dir.ID), nil
 	}
 
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
-		return fs.createUploadFile(ctx, name, flag)
+		return fs.createUploadFile(ctx, userID, name, flag)
 	}
-	return newReadFile(ctx, fs.tg, entry.file), nil
+	parts, err := fs.store.ListFileParts(ctx, entry.file.ID)
+	if err != nil {
+		return nil, err
+	}
+	return newReadFile(ctx, fs.tg, entry.file, parts), nil
 }
 
 func (fs *davFS) RemoveAll(ctx context.Context, name string) error {
-	entry, err := fs.resolve(ctx, name)
+	userID, err := fs.userID(ctx)
+	if err != nil {
+		return err
+	}
+	entry, err := fs.resolve(ctx, userID, name)
 	if err != nil {
 		return err
 	}
 	if entry.isDir {
-		return fs.store.DeleteDirRecursive(ctx, fs.ownerID, entry.dir.ID)
+		return fs.store.DeleteDirRecursive(ctx, userID, entry.dir.ID)
 	}
-	return fs.store.DeleteFile(ctx, fs.ownerID, entry.file.ID)
+	return fs.store.DeleteFile(ctx, userID, entry.file.ID)
 }
 
 func (fs *davFS) Rename(ctx context.Context, oldName, newName string) error {
-	entry, err := fs.resolve(ctx, oldName)
+	userID, err := fs.userID(ctx)
+	if err != nil {
+		return err
+	}
+	entry, err := fs.resolve(ctx, userID, oldName)
 	if err != nil {
 		return err
 	}
@@ -137,24 +192,28 @@ func (fs *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	if base == "" {
 		return errors.New("invalid target name")
 	}
-	parentDir, err := fs.store.FindDirByPath(ctx, fs.ownerID, parentParts)
+	parentDir, err := fs.store.FindDirByPath(ctx, userID, parentParts)
 	if err != nil {
 		return err
 	}
 	if entry.isDir {
-		if err := fs.store.MoveDir(ctx, fs.ownerID, entry.dir.ID, parentDir.ID); err != nil {
+		if err := fs.store.MoveDir(ctx, userID, entry.dir.ID, parentDir.ID); err != nil {
 			return err
 		}
-		return fs.store.RenameDir(ctx, fs.ownerID, entry.dir.ID, base)
+		return fs.store.RenameDir(ctx, userID, entry.dir.ID, base)
 	}
-	if err := fs.store.MoveFile(ctx, fs.ownerID, entry.file.ID, parentDir.ID); err != nil {
+	if err := fs.store.MoveFile(ctx, userID, entry.file.ID, parentDir.ID); err != nil {
 		return err
 	}
-	return fs.store.RenameFile(ctx, fs.ownerID, entry.file.ID, base)
+	return fs.store.RenameFile(ctx, userID, entry.file.ID, base)
 }
 
 func (fs *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	entry, err := fs.resolve(ctx, name)
+	userID, err := fs.userID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := fs.resolve(ctx, userID, name)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +223,7 @@ func (fs *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	return fileInfo(entry.file), nil
 }
 
-func (fs *davFS) createUploadFile(ctx context.Context, name string, flag int) (webdav.File, error) {
+func (fs *davFS) createUploadFile(ctx context.Context, userID int64, name string, flag int) (webdav.File, error) {
 	if fs.storageChatID == 0 {
 		return nil, errors.New("STORAGE_CHAT_ID is required for WebDAV uploads")
 	}
@@ -172,15 +231,15 @@ func (fs *davFS) createUploadFile(ctx context.Context, name string, flag int) (w
 	if base == "" {
 		return nil, errors.New("invalid file name")
 	}
-	parentDir, err := fs.store.FindDirByPath(ctx, fs.ownerID, parentParts)
+	parentDir, err := fs.store.FindDirByPath(ctx, userID, parentParts)
 	if err != nil {
 		return nil, err
 	}
 	var existing *db.File
-	if entry, err := fs.resolve(ctx, name); err == nil && !entry.isDir {
+	if entry, err := fs.resolve(ctx, userID, name); err == nil && !entry.isDir {
 		existing = &entry.file
 	}
-	return newUploadFile(ctx, fs.tg, fs.store, fs.ownerID, fs.storageChatID, parentDir.ID, base, existing), nil
+	return newUploadFile(ctx, fs.tg, fs.store, userID, fs.storageChatID, parentDir.ID, base, existing, fs.maxPartSize), nil
 }
 
 type davEntry struct {
@@ -189,14 +248,14 @@ type davEntry struct {
 	file  db.File
 }
 
-func (fs *davFS) resolve(ctx context.Context, name string) (davEntry, error) {
+func (fs *davFS) resolve(ctx context.Context, userID int64, name string) (davEntry, error) {
 	clean := path.Clean("/" + name)
 	if clean == "/" {
-		rootID, err := fs.store.GetRootDirID(ctx, fs.ownerID)
+		rootID, err := fs.store.GetRootDirID(ctx, userID)
 		if err != nil {
 			return davEntry{}, err
 		}
-		dir, err := fs.store.GetDirByID(ctx, fs.ownerID, rootID)
+		dir, err := fs.store.GetDirByID(ctx, userID, rootID)
 		if err != nil {
 			return davEntry{}, err
 		}
@@ -205,14 +264,14 @@ func (fs *davFS) resolve(ctx context.Context, name string) (davEntry, error) {
 	parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
 	parentParts := parts[:len(parts)-1]
 	base := parts[len(parts)-1]
-	parentDir, err := fs.store.FindDirByPath(ctx, fs.ownerID, parentParts)
+	parentDir, err := fs.store.FindDirByPath(ctx, userID, parentParts)
 	if err != nil {
 		return davEntry{}, err
 	}
-	if dir, err := fs.store.GetDirByName(ctx, fs.ownerID, parentDir.ID, base); err == nil {
+	if dir, err := fs.store.GetDirByName(ctx, userID, parentDir.ID, base); err == nil {
 		return davEntry{isDir: true, dir: dir}, nil
 	}
-	file, err := fs.store.GetFileByName(ctx, fs.ownerID, parentDir.ID, base)
+	file, err := fs.store.GetFileByName(ctx, userID, parentDir.ID, base)
 	if err != nil {
 		return davEntry{}, os.ErrNotExist
 	}
@@ -324,17 +383,35 @@ func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
 
 // readFile streams from Telegram.
 type readFile struct {
-	ctx      context.Context
-	tg       *telegram.Client
-	file     db.File
-	filePath string
-	offset   int64
-	reader   io.ReadCloser
-	mu       sync.Mutex
+	ctx        context.Context
+	tg         *telegram.Client
+	file       db.File
+	filePath   string
+	parts      []db.FilePart
+	partIndex  int
+	partOffset int64
+	partPaths  map[int]string
+	offset     int64
+	totalSize  int64
+	reader     io.ReadCloser
+	mu         sync.Mutex
 }
 
-func newReadFile(ctx context.Context, tg *telegram.Client, file db.File) *readFile {
-	return &readFile{ctx: ctx, tg: tg, file: file}
+func newReadFile(ctx context.Context, tg *telegram.Client, file db.File, parts []db.FilePart) *readFile {
+	total := file.Size
+	if total == 0 && len(parts) > 0 {
+		for _, part := range parts {
+			total += part.Size
+		}
+	}
+	return &readFile{
+		ctx:       ctx,
+		tg:        tg,
+		file:      file,
+		parts:     parts,
+		totalSize: total,
+		partPaths: make(map[int]string),
+	}
 }
 
 func (f *readFile) Stat() (os.FileInfo, error) {
@@ -353,15 +430,43 @@ func (f *readFile) ensurePath() (string, error) {
 	return f.filePath, nil
 }
 
+func (f *readFile) ensurePartPath(index int) (string, error) {
+	if path, ok := f.partPaths[index]; ok {
+		return path, nil
+	}
+	part := f.parts[index]
+	info, err := f.tg.GetFile(f.ctx, part.TelegramFileID)
+	if err != nil {
+		return "", err
+	}
+	f.partPaths[index] = info.FilePath
+	return info.FilePath, nil
+}
+
 func (f *readFile) ensureReader() error {
 	if f.reader != nil {
 		return nil
 	}
-	path, err := f.ensurePath()
+	if len(f.parts) == 0 {
+		path, err := f.ensurePath()
+		if err != nil {
+			return err
+		}
+		reader, err := f.tg.DownloadFile(f.ctx, path, f.offset)
+		if err != nil {
+			return err
+		}
+		f.reader = reader
+		return nil
+	}
+	if f.partIndex >= len(f.parts) {
+		return io.EOF
+	}
+	path, err := f.ensurePartPath(f.partIndex)
 	if err != nil {
 		return err
 	}
-	reader, err := f.tg.DownloadFile(f.ctx, path, f.offset)
+	reader, err := f.tg.DownloadFile(f.ctx, path, f.partOffset)
 	if err != nil {
 		return err
 	}
@@ -372,16 +477,45 @@ func (f *readFile) ensureReader() error {
 func (f *readFile) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.ensureReader(); err != nil {
-		return 0, err
+	if len(f.parts) == 0 {
+		if err := f.ensureReader(); err != nil {
+			return 0, err
+		}
+		n, err := f.reader.Read(p)
+		f.offset += int64(n)
+		if err == io.EOF {
+			_ = f.reader.Close()
+			f.reader = nil
+		}
+		return n, err
 	}
-	n, err := f.reader.Read(p)
-	f.offset += int64(n)
-	if err == io.EOF {
-		_ = f.reader.Close()
-		f.reader = nil
+	for {
+		if f.partIndex >= len(f.parts) {
+			return 0, io.EOF
+		}
+		if err := f.ensureReader(); err != nil {
+			if err == io.EOF {
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+		n, err := f.reader.Read(p)
+		f.partOffset += int64(n)
+		f.offset += int64(n)
+		if err == io.EOF {
+			_ = f.reader.Close()
+			f.reader = nil
+			if f.partOffset >= f.parts[f.partIndex].Size {
+				f.partIndex++
+				f.partOffset = 0
+				if n > 0 {
+					return n, nil
+				}
+				continue
+			}
+		}
+		return n, err
 	}
-	return n, err
 }
 
 func (f *readFile) Seek(offset int64, whence int) (int64, error) {
@@ -394,14 +528,23 @@ func (f *readFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		newOffset = f.offset + offset
 	case io.SeekEnd:
-		newOffset = f.file.Size + offset
+		if f.totalSize == 0 {
+			f.totalSize = f.file.Size
+		}
+		newOffset = f.totalSize + offset
 	default:
 		return f.offset, errors.New("invalid seek")
 	}
 	if newOffset < 0 {
 		return f.offset, errors.New("negative seek")
 	}
+	if f.totalSize > 0 && newOffset > f.totalSize {
+		return f.offset, errors.New("seek beyond end")
+	}
 	f.offset = newOffset
+	if len(f.parts) > 0 {
+		f.partIndex, f.partOffset = locatePart(f.parts, newOffset)
+	}
 	if f.reader != nil {
 		_ = f.reader.Close()
 		f.reader = nil
@@ -426,7 +569,18 @@ func (f *readFile) Readdir(count int) ([]os.FileInfo, error) {
 	return nil, errors.New("not a directory")
 }
 
-// uploadFile streams uploads into Telegram.
+func locatePart(parts []db.FilePart, offset int64) (int, int64) {
+	var total int64
+	for i, part := range parts {
+		if offset < total+part.Size {
+			return i, offset - total
+		}
+		total += part.Size
+	}
+	return len(parts), 0
+}
+
+// uploadFile streams uploads into Telegram, splitting into parts when needed.
 type uploadFile struct {
 	ctx           context.Context
 	tg            *telegram.Client
@@ -436,10 +590,21 @@ type uploadFile struct {
 	parentDirID   int64
 	name          string
 	existing      *db.File
-	pipeW         *io.PipeWriter
-	done          chan uploadResult
-	started       bool
+	maxPartSize   int64
+	partIndex     int
+	totalSize     int64
+	parts         []db.FilePartInput
+	mimeType      string
+	current       *uploadPart
+	closed        bool
 	mu            sync.Mutex
+}
+
+type uploadPart struct {
+	index int
+	size  int64
+	pipeW *io.PipeWriter
+	done  chan uploadResult
 }
 
 type uploadResult struct {
@@ -447,53 +612,96 @@ type uploadResult struct {
 	err error
 }
 
-func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File) *uploadFile {
-	return &uploadFile{ctx: ctx, tg: tg, store: store, ownerID: ownerID, storageChatID: storageChatID, parentDirID: parentDirID, name: name, existing: existing, done: make(chan uploadResult, 1)}
-}
-
-func (f *uploadFile) start() error {
-	pr, pw := io.Pipe()
-	f.pipeW = pw
-	f.started = true
-	go func() {
-		msg, err := f.tg.UploadDocument(f.ctx, f.storageChatID, f.name, pr)
-		f.done <- uploadResult{msg: msg, err: err}
-	}()
-	return nil
+func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File, maxPartSize int64) *uploadFile {
+	if maxPartSize <= 0 {
+		maxPartSize = 1900 * 1024 * 1024
+	}
+	return &uploadFile{
+		ctx:           ctx,
+		tg:            tg,
+		store:         store,
+		ownerID:       ownerID,
+		storageChatID: storageChatID,
+		parentDirID:   parentDirID,
+		name:          name,
+		existing:      existing,
+		maxPartSize:   maxPartSize,
+	}
 }
 
 func (f *uploadFile) Write(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.started {
-		if err := f.start(); err != nil {
-			return 0, err
+	if f.closed {
+		return 0, errors.New("upload already closed")
+	}
+	written := 0
+	for len(p) > 0 {
+		if f.current == nil {
+			if err := f.startPartLocked(); err != nil {
+				return written, err
+			}
+		}
+		remaining := f.maxPartSize - f.current.size
+		if remaining <= 0 {
+			if err := f.finishPartLocked(); err != nil {
+				return written, err
+			}
+			continue
+		}
+		toWrite := int64(len(p))
+		if toWrite > remaining {
+			toWrite = remaining
+		}
+		n, err := f.current.pipeW.Write(p[:int(toWrite)])
+		f.current.size += int64(n)
+		f.totalSize += int64(n)
+		written += n
+		p = p[n:]
+		if err != nil {
+			return written, err
+		}
+		if f.current.size >= f.maxPartSize {
+			if err := f.finishPartLocked(); err != nil {
+				return written, err
+			}
 		}
 	}
-	return f.pipeW.Write(p)
+	return written, nil
 }
 
 func (f *uploadFile) Close() error {
 	f.mu.Lock()
-	if f.started {
-		_ = f.pipeW.Close()
-	}
-	f.mu.Unlock()
-	if !f.started {
+	if f.closed {
+		f.mu.Unlock()
 		return nil
 	}
-	res := <-f.done
-	if res.err != nil {
-		return res.err
+	f.closed = true
+	if f.current != nil {
+		if err := f.finishPartLocked(); err != nil {
+			f.mu.Unlock()
+			return err
+		}
 	}
-	if res.msg == nil || res.msg.Document == nil {
-		return errors.New("telegram upload returned no document")
+	parts := append([]db.FilePartInput(nil), f.parts...)
+	totalSize := f.totalSize
+	mimeType := f.mimeType
+	name := f.name
+	existing := f.existing
+	f.mu.Unlock()
+
+	if len(parts) == 0 {
+		return errors.New("empty upload")
 	}
-	doc := res.msg.Document
-	if f.existing != nil {
-		return f.store.UpdateFileTelegram(f.ctx, f.ownerID, f.existing.ID, doc.FileID, doc.FileUniqueID, doc.FileSize, doc.MimeType)
+	first := parts[0]
+	if existing != nil {
+		return f.store.ReplaceFileWithParts(f.ctx, f.ownerID, existing.ID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
 	}
-	_, err := f.store.CreateFile(f.ctx, f.ownerID, f.parentDirID, f.name, doc.FileID, doc.FileUniqueID, doc.FileSize, doc.MimeType)
+	if len(parts) > 1 {
+		_, err := f.store.CreateFileWithParts(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
+		return err
+	}
+	_, err := f.store.CreateFile(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType)
 	return err
 }
 
@@ -506,9 +714,64 @@ func (f *uploadFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *uploadFile) Stat() (os.FileInfo, error) {
-	return davFileInfo{name: f.name, size: 0, mode: 0o644, modTime: time.Now().UTC(), isDir: false}, nil
+	return davFileInfo{name: f.name, size: f.totalSize, mode: 0o644, modTime: time.Now().UTC(), isDir: false}, nil
 }
 
 func (f *uploadFile) Readdir(count int) ([]os.FileInfo, error) {
 	return nil, errors.New("not a directory")
+}
+
+func (f *uploadFile) startPartLocked() error {
+	pr, pw := io.Pipe()
+	partIndex := f.partIndex
+	filename := f.partFilename(partIndex)
+	done := make(chan uploadResult, 1)
+	go func() {
+		msg, err := f.tg.UploadDocument(f.ctx, f.storageChatID, filename, pr)
+		done <- uploadResult{msg: msg, err: err}
+	}()
+	f.current = &uploadPart{
+		index: partIndex,
+		pipeW: pw,
+		done:  done,
+	}
+	return nil
+}
+
+func (f *uploadFile) finishPartLocked() error {
+	if f.current == nil {
+		return nil
+	}
+	_ = f.current.pipeW.Close()
+	res := <-f.current.done
+	if res.err != nil {
+		return res.err
+	}
+	if res.msg == nil || res.msg.Document == nil {
+		return errors.New("telegram upload returned no document")
+	}
+	doc := res.msg.Document
+	size := doc.FileSize
+	if size == 0 {
+		size = f.current.size
+	}
+	f.parts = append(f.parts, db.FilePartInput{
+		PartIndex:      f.current.index,
+		TelegramFileID: doc.FileID,
+		FileUniqueID:   doc.FileUniqueID,
+		Size:           size,
+	})
+	if f.mimeType == "" && doc.MimeType != "" {
+		f.mimeType = doc.MimeType
+	}
+	f.partIndex++
+	f.current = nil
+	return nil
+}
+
+func (f *uploadFile) partFilename(index int) string {
+	if index == 0 {
+		return f.name
+	}
+	return fmt.Sprintf("%s.part%03d", f.name, index+1)
 }

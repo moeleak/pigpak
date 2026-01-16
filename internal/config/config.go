@@ -19,11 +19,10 @@ type Config struct {
 	DBPath          string
 	PollTimeout     time.Duration
 	PageSize        int
+	MaxPartSizeBytes int64
 	WebDAVEnable    bool
 	WebDAVAddr      string
-	WebDAVUser      string
-	WebDAVPassword  string
-	WebDAVOwnerID   int64
+	WebDAVPublicURL string
 	StorageChatID   int64
 	ShareBaseURL    string
 }
@@ -50,22 +49,18 @@ func Load() (Config, error) {
 	}
 	cfg.PollTimeout = parseDuration("POLL_TIMEOUT", 30*time.Second)
 	cfg.PageSize = parseInt("PAGE_SIZE", 8)
+	cfg.MaxPartSizeBytes = parseInt64("MAX_PART_SIZE_BYTES", 1900*1024*1024)
+	if cfg.MaxPartSizeBytes <= 0 {
+		cfg.MaxPartSizeBytes = 1900 * 1024 * 1024
+	}
 
 	cfg.WebDAVEnable = parseBool("WEB_DAV_ENABLE", false)
 	cfg.WebDAVAddr = strings.TrimSpace(os.Getenv("WEB_DAV_ADDR"))
 	if cfg.WebDAVAddr == "" {
 		cfg.WebDAVAddr = ":8081"
 	}
-	cfg.WebDAVUser = strings.TrimSpace(os.Getenv("WEB_DAV_USER"))
-	cfg.WebDAVPassword = strings.TrimSpace(os.Getenv("WEB_DAV_PASSWORD"))
-	cfg.WebDAVOwnerID = parseInt64("WEB_DAV_OWNER_ID", 0)
+	cfg.WebDAVPublicURL = strings.TrimSpace(os.Getenv("WEB_DAV_PUBLIC_URL"))
 	cfg.StorageChatID = parseInt64("STORAGE_CHAT_ID", 0)
-	if cfg.WebDAVOwnerID == 0 {
-		cfg.WebDAVOwnerID = cfg.StorageChatID
-	}
-	if cfg.StorageChatID == 0 {
-		cfg.StorageChatID = cfg.WebDAVOwnerID
-	}
 
 	cfg.ShareBaseURL = strings.TrimSpace(os.Getenv("SHARE_BASE_URL"))
 	if cfg.ShareBaseURL == "" && cfg.BotUsername != "" {

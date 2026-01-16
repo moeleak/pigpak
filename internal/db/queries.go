@@ -2,7 +2,11 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,6 +34,25 @@ type File struct {
 	Size         int64
 	MimeType     string
 	CreatedAt    time.Time
+}
+
+// FilePart represents a chunk of a large file.
+type FilePart struct {
+	ID             int64
+	FileID         int64
+	PartIndex      int
+	TelegramFileID string
+	FileUniqueID   string
+	Size           int64
+	CreatedAt      time.Time
+}
+
+// FilePartInput is used to insert file parts.
+type FilePartInput struct {
+	PartIndex      int
+	TelegramFileID string
+	FileUniqueID   string
+	Size           int64
 }
 
 // Share represents a share link.
@@ -91,6 +114,88 @@ func (s *Store) EnsureUser(ctx context.Context, userID int64) (int64, error) {
 		return 0, err
 	}
 	return rootID, nil
+}
+
+// UpsertUserProfile stores the latest username for a user.
+func (s *Store) UpsertUserProfile(ctx context.Context, userID int64, username string) error {
+	if username == "" {
+		return nil
+	}
+	usernameLower := strings.ToLower(username)
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM user_profiles WHERE username_lower = ? AND user_id != ?`, usernameLower, userID); err != nil {
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO user_profiles(user_id, username, username_lower, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, username_lower = excluded.username_lower, updated_at = excluded.updated_at`,
+		userID, username, usernameLower, now())
+	return err
+}
+
+// GetUserIDByUsername resolves a Telegram username to a user ID.
+func (s *Store) GetUserIDByUsername(ctx context.Context, username string) (int64, error) {
+	if username == "" {
+		return 0, sql.ErrNoRows
+	}
+	var userID int64
+	usernameLower := strings.ToLower(username)
+	row := s.DB.QueryRowContext(ctx, `SELECT user_id FROM user_profiles WHERE username_lower = ?`, usernameLower)
+	if err := row.Scan(&userID); err != nil {
+		return 0, err
+	}
+	return userID, nil
+}
+
+// SetWebDAVPassword stores a password hash for a user.
+func (s *Store) SetWebDAVPassword(ctx context.Context, userID int64, password string) error {
+	if password == "" {
+		return errors.New("password cannot be empty")
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return err
+	}
+	hash := hashWebDAVPassword(password, salt)
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO webdav_credentials(user_id, password_salt, password_hash, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET password_salt = excluded.password_salt, password_hash = excluded.password_hash, updated_at = excluded.updated_at`,
+		userID, hex.EncodeToString(salt), hash, now())
+	return err
+}
+
+// WebDAVPasswordSet checks if a password is configured.
+func (s *Store) WebDAVPasswordSet(ctx context.Context, userID int64) (bool, error) {
+	var one int
+	row := s.DB.QueryRowContext(ctx, `SELECT 1 FROM webdav_credentials WHERE user_id = ? LIMIT 1`, userID)
+	if err := row.Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return one == 1, nil
+}
+
+// VerifyWebDAVPassword validates a password against stored hash.
+func (s *Store) VerifyWebDAVPassword(ctx context.Context, userID int64, password string) (bool, error) {
+	if password == "" {
+		return false, nil
+	}
+	var saltHex, hash string
+	row := s.DB.QueryRowContext(ctx, `SELECT password_salt, password_hash FROM webdav_credentials WHERE user_id = ?`, userID)
+	if err := row.Scan(&saltHex, &hash); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return false, err
+	}
+	expect := hashWebDAVPassword(password, salt)
+	ok := subtle.ConstantTimeCompare([]byte(expect), []byte(hash)) == 1
+	return ok, nil
 }
 
 // GetRootDirID returns the root dir ID for a user.
@@ -259,6 +364,81 @@ func (s *Store) CreateFile(ctx context.Context, userID, dirID int64, name, fileI
 	return s.GetFileByID(ctx, userID, id)
 }
 
+// CreateFileWithParts inserts a file and its parts.
+func (s *Store) CreateFileWithParts(ctx context.Context, userID, dirID int64, name, fileID, fileUniqueID string, size int64, mimeType string, parts []FilePartInput) (File, error) {
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return File{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.ExecContext(ctx, `INSERT INTO files(user_id, dir_id, name, file_id, file_unique_id, size, mime_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, userID, dirID, name, fileID, fileUniqueID, size, mimeType, now())
+	if err != nil {
+		return File{}, err
+	}
+	fileRowID, err := res.LastInsertId()
+	if err != nil {
+		return File{}, err
+	}
+	if len(parts) > 1 {
+		if err := insertFilePartsTx(ctx, tx, fileRowID, parts); err != nil {
+			return File{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return File{}, err
+	}
+	committed = true
+	return s.GetFileByID(ctx, userID, fileRowID)
+}
+
+// ReplaceFileWithParts updates a file and replaces its parts.
+func (s *Store) ReplaceFileWithParts(ctx context.Context, userID, fileID int64, name, telegramFileID, fileUniqueID string, size int64, mimeType string, parts []FilePartInput) error {
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.ExecContext(ctx, `UPDATE files SET name = ?, file_id = ?, file_unique_id = ?, size = ?, mime_type = ? WHERE id = ? AND user_id = ?`, name, telegramFileID, fileUniqueID, size, mimeType, fileID, userID)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM file_parts WHERE file_id = ?`, fileID); err != nil {
+		return err
+	}
+	if len(parts) > 1 {
+		if err := insertFilePartsTx(ctx, tx, fileID, parts); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
 // UpdateFileTelegram updates the Telegram identifiers for a file.
 func (s *Store) UpdateFileTelegram(ctx context.Context, userID, fileID int64, telegramFileID, fileUniqueID string, size int64, mimeType string) error {
 	if mimeType == "" {
@@ -332,6 +512,40 @@ func (s *Store) DeleteFile(ctx context.Context, userID, fileID int64) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// ListFileParts returns the parts for a file ordered by index.
+func (s *Store) ListFileParts(ctx context.Context, fileID int64) ([]FilePart, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, file_id, part_index, telegram_file_id, file_unique_id, size, created_at FROM file_parts WHERE file_id = ? ORDER BY part_index`, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var parts []FilePart
+	for rows.Next() {
+		var p FilePart
+		if err := rows.Scan(&p.ID, &p.FileID, &p.PartIndex, &p.TelegramFileID, &p.FileUniqueID, &p.Size, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		parts = append(parts, p)
+	}
+	return parts, rows.Err()
+}
+
+func insertFilePartsTx(ctx context.Context, tx *sql.Tx, fileID int64, parts []FilePartInput) error {
+	for _, part := range parts {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO file_parts(file_id, part_index, telegram_file_id, file_unique_id, size, created_at) VALUES (?, ?, ?, ?, ?, ?)`, fileID, part.PartIndex, part.TelegramFileID, part.FileUniqueID, part.Size, now()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hashWebDAVPassword(password string, salt []byte) string {
+	h := sha256.New()
+	_, _ = h.Write(salt)
+	_, _ = h.Write([]byte(password))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // CreateShare creates a share record.

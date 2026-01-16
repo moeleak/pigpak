@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  pigpak:
+    image: pigpak
+    build: .
+    env_file: .env
+    environment:
+      - DATA_DIR=/data
+      - DB_PATH=/data/bot.db
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "8081"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN}
+      - CADDY_EMAIL=${CADDY_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - pigpak
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -71,9 +71,13 @@ func (b *Bot) handleMessage(ctx context.Context, msg *telegram.Message) {
 		log.Printf("ensure user state: %v", err)
 		return
 	}
+	b.trackUser(ctx, msg.From)
 
 	if msg.Text != "" {
 		if b.handleStart(ctx, userID, chatID, msg.Text) {
+			return
+		}
+		if b.handleWebDAVCommand(ctx, chatID, msg.From, msg.Text) {
 			return
 		}
 		if b.handlePendingText(ctx, userID, chatID, msg.Text) {
@@ -174,12 +178,108 @@ func (b *Bot) handlePendingText(ctx context.Context, userID, chatID int64, text 
 }
 
 func (b *Bot) sendHelp(ctx context.Context, chatID int64) {
-	text := "Send files to upload. Use the buttons to browse folders, share files, and manage directories."
+	text := "Send files to upload. Use the buttons to browse folders, share files, and manage directories. Use /webdav or /webdav set <password> for WebDAV access."
 	_, _ = b.tg.SendMessage(ctx, chatID, text, nil)
 }
 
 func (b *Bot) sendText(ctx context.Context, chatID int64, text string) {
 	_, _ = b.tg.SendMessage(ctx, chatID, text, nil)
+}
+
+func (b *Bot) handleWebDAVCommand(ctx context.Context, chatID int64, user *telegram.User, text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	cmd := strings.Split(fields[0], "@")[0]
+	if cmd != "/webdav" {
+		return false
+	}
+	if !b.cfg.WebDAVEnable {
+		b.sendText(ctx, chatID, "WebDAV is disabled on this server.")
+		return true
+	}
+	if user == nil || strings.TrimSpace(user.Username) == "" {
+		b.sendText(ctx, chatID, "Set a Telegram username first, then retry /webdav.")
+		return true
+	}
+	if len(fields) >= 2 {
+		action := strings.ToLower(fields[1])
+		if action == "set" || action == "password" {
+			pass := strings.TrimSpace(strings.Join(fields[2:], " "))
+			if pass == "" {
+				b.sendText(ctx, chatID, "Usage: /webdav set <password>")
+				return true
+			}
+			if err := b.store.SetWebDAVPassword(ctx, user.ID, pass); err != nil {
+				b.sendText(ctx, chatID, fmt.Sprintf("Set password failed: %v", err))
+				return true
+			}
+			b.sendWebDAVInfo(ctx, chatID, user)
+			return true
+		}
+	}
+	b.sendWebDAVInfo(ctx, chatID, user)
+	return true
+}
+
+func (b *Bot) trackUser(ctx context.Context, user *telegram.User) {
+	if user == nil {
+		return
+	}
+	if err := b.store.UpsertUserProfile(ctx, user.ID, strings.TrimSpace(user.Username)); err != nil {
+		log.Printf("store user profile: %v", err)
+	}
+}
+
+func (b *Bot) sendWebDAVInfo(ctx context.Context, chatID int64, user *telegram.User) {
+	if !b.cfg.WebDAVEnable {
+		b.sendText(ctx, chatID, "WebDAV is disabled on this server.")
+		return
+	}
+	if user == nil || strings.TrimSpace(user.Username) == "" {
+		b.sendText(ctx, chatID, "Set a Telegram username first, then retry /webdav.")
+		return
+	}
+	url := b.webdavURL()
+	if url == "" {
+		url = "http://<server-host>" + b.cfg.WebDAVAddr
+	}
+	hasPassword, err := b.store.WebDAVPasswordSet(ctx, user.ID)
+	if err != nil {
+		b.sendText(ctx, chatID, fmt.Sprintf("WebDAV status error: %v", err))
+		return
+	}
+	passwordStatus := "not set"
+	setHint := ""
+	if hasPassword {
+		passwordStatus = "set"
+	} else {
+		setHint = "\nSet it with: /webdav set <password>"
+	}
+	uploadNote := ""
+	if b.cfg.StorageChatID == 0 {
+		uploadNote = "\nNote: WebDAV uploads are disabled (STORAGE_CHAT_ID not set)."
+	}
+	text := fmt.Sprintf("WebDAV URL: %s\nUsername: %s\nPassword: %s%s%s", url, user.Username, passwordStatus, setHint, uploadNote)
+	b.sendText(ctx, chatID, text)
+}
+
+func (b *Bot) webdavURL() string {
+	if b.cfg.WebDAVPublicURL != "" {
+		return b.cfg.WebDAVPublicURL
+	}
+	addr := strings.TrimSpace(b.cfg.WebDAVAddr)
+	if addr == "" {
+		return ""
+	}
+	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+		return addr
+	}
+	if strings.HasPrefix(addr, ":") {
+		return "http://<server-host>" + addr
+	}
+	return "http://" + addr
 }
 
 func (b *Bot) handleUpload(ctx context.Context, userID, chatID int64, file *incomingFile) {
@@ -221,6 +321,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 	if err := b.store.EnsureUserState(ctx, userID); err != nil {
 		log.Printf("ensure user state: %v", err)
 	}
+	b.trackUser(ctx, cb.From)
 	if cb.Message == nil {
 		_ = b.tg.AnswerCallbackQuery(ctx, cb.ID, "")
 		return
@@ -288,7 +389,16 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 			b.sendText(ctx, chatID, "File not found.")
 			return
 		}
-		_, _ = b.tg.SendDocument(ctx, chatID, file.FileID, file.Name, nil)
+		parts, err := b.store.ListFileParts(ctx, file.ID)
+		if err != nil {
+			b.sendText(ctx, chatID, fmt.Sprintf("Load parts failed: %v", err))
+			return
+		}
+		if len(parts) == 0 {
+			_, _ = b.tg.SendDocument(ctx, chatID, file.FileID, file.Name, nil)
+			return
+		}
+		b.sendFileParts(ctx, chatID, file, parts)
 	case strings.HasPrefix(data, "share:"):
 		parts := strings.Split(data, ":")
 		if len(parts) != 3 {
@@ -365,7 +475,7 @@ func (b *Bot) handleCallback(ctx context.Context, cb *telegram.CallbackQuery) {
 			return
 		}
 		currentDir, _ := b.store.GetCurrentDirID(ctx, userID)
-		_, err = b.store.CreateFile(ctx, userID, currentDir, file.Name, file.FileID, file.FileUniqueID, file.Size, file.MimeType)
+		err = b.saveSharedFile(ctx, userID, currentDir, file)
 		if err != nil {
 			b.sendText(ctx, chatID, fmt.Sprintf("Save failed: %v", err))
 			return
@@ -399,13 +509,63 @@ func (b *Bot) editDirectoryView(ctx context.Context, userID, chatID int64, msgID
 }
 
 func (b *Bot) sendFileDetail(ctx context.Context, userID, chatID int64, file db.File, link string) {
-	text, markup := b.fileDetailView(file, link)
+	partCount := b.filePartCount(ctx, file.ID)
+	text, markup := b.fileDetailView(file, link, partCount)
 	_, _ = b.tg.SendMessage(ctx, chatID, text, markup)
 }
 
 func (b *Bot) editFileDetail(ctx context.Context, userID, chatID int64, msgID int, file db.File, link string) {
-	text, markup := b.fileDetailView(file, link)
+	partCount := b.filePartCount(ctx, file.ID)
+	text, markup := b.fileDetailView(file, link, partCount)
 	_, _ = b.tg.EditMessageText(ctx, chatID, msgID, text, markup)
+}
+
+func (b *Bot) filePartCount(ctx context.Context, fileID int64) int {
+	parts, err := b.store.ListFileParts(ctx, fileID)
+	if err != nil {
+		return 0
+	}
+	return len(parts)
+}
+
+func (b *Bot) sendFileParts(ctx context.Context, chatID int64, file db.File, parts []db.FilePart) {
+	total := len(parts)
+	for i, part := range parts {
+		caption := file.Name
+		if total > 1 {
+			caption = fmt.Sprintf("%s (part %d/%d)", file.Name, i+1, total)
+		}
+		_, _ = b.tg.SendDocument(ctx, chatID, part.TelegramFileID, caption, nil)
+	}
+}
+
+func (b *Bot) saveSharedFile(ctx context.Context, userID, dirID int64, file db.File) error {
+	parts, err := b.store.ListFileParts(ctx, file.ID)
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		_, err = b.store.CreateFile(ctx, userID, dirID, file.Name, file.FileID, file.FileUniqueID, file.Size, file.MimeType)
+		return err
+	}
+	totalSize := file.Size
+	if totalSize == 0 {
+		for _, part := range parts {
+			totalSize += part.Size
+		}
+	}
+	inputs := make([]db.FilePartInput, 0, len(parts))
+	for _, part := range parts {
+		inputs = append(inputs, db.FilePartInput{
+			PartIndex:      part.PartIndex,
+			TelegramFileID: part.TelegramFileID,
+			FileUniqueID:   part.FileUniqueID,
+			Size:           part.Size,
+		})
+	}
+	first := inputs[0]
+	_, err = b.store.CreateFileWithParts(ctx, userID, dirID, file.Name, first.TelegramFileID, first.FileUniqueID, totalSize, file.MimeType, inputs)
+	return err
 }
 
 func (b *Bot) editDirectoryPicker(ctx context.Context, userID, chatID int64, msgID int, dirID int64) {
@@ -554,8 +714,13 @@ func (b *Bot) directoryPicker(ctx context.Context, userID, dirID int64) (string,
 	return text, markup, nil
 }
 
-func (b *Bot) fileDetailView(file db.File, link string) (string, *telegram.InlineKeyboardMarkup) {
-	text := fmt.Sprintf("File: %s\nSize: %s\nType: %s\nCache ID: %s", file.Name, formatBytes(file.Size), file.MimeType, file.FileUniqueID)
+func (b *Bot) fileDetailView(file db.File, link string, partCount int) (string, *telegram.InlineKeyboardMarkup) {
+	text := fmt.Sprintf("File: %s\nSize: %s\nType: %s", file.Name, formatBytes(file.Size), file.MimeType)
+	if partCount > 0 {
+		text += fmt.Sprintf("\nParts: %d", partCount)
+	} else {
+		text += fmt.Sprintf("\nCache ID: %s", file.FileUniqueID)
+	}
 	if link != "" {
 		text += fmt.Sprintf("\nShare link: %s", link)
 	}
