@@ -276,6 +276,21 @@ func (c *Client) UploadDocument(ctx context.Context, chatID int64, filename stri
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	resultCh := make(chan error, 1)
+	closeReader := func(err error) {
+		type closeWithError interface {
+			CloseWithError(error) error
+		}
+		if reader == nil {
+			return
+		}
+		if closer, ok := reader.(closeWithError); ok {
+			_ = closer.CloseWithError(err)
+			return
+		}
+		if closer, ok := reader.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
 	go func() {
 		defer pw.Close()
 		if err := mw.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
@@ -296,25 +311,54 @@ func (c *Client) UploadDocument(ctx context.Context, chatID int64, filename stri
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("sendDocument"), pr)
 	if err != nil {
+		_ = pw.CloseWithError(err)
+		closeReader(err)
 		return nil, err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := c.HTTP.Do(req)
+	client := c.HTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if client.Timeout != 0 {
+		clone := *client
+		clone.Timeout = 0
+		client = &clone
+	}
+	resp, err := client.Do(req)
 	if err != nil {
+		_ = pw.CloseWithError(err)
+		closeReader(err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("telegram upload status: %s", resp.Status)
+		err := fmt.Errorf("telegram upload status: %s", resp.Status)
+		_ = pw.CloseWithError(err)
+		closeReader(err)
+		return nil, err
 	}
 	var apiResp apiResponse[Message]
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		_ = pw.CloseWithError(err)
+		closeReader(err)
 		return nil, err
 	}
 	if !apiResp.OK {
-		return nil, fmt.Errorf("telegram upload failed: %s", apiResp.Description)
+		err := fmt.Errorf("telegram upload failed: %s", apiResp.Description)
+		_ = pw.CloseWithError(err)
+		closeReader(err)
+		return nil, err
 	}
-	if err := <-resultCh; err != nil {
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		err := ctx.Err()
+		_ = pw.CloseWithError(err)
+		closeReader(err)
 		return nil, err
 	}
 	return &apiResp.Result, nil

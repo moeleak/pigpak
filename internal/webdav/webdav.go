@@ -87,6 +87,7 @@ func (s *Server) wrapAuth(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), webdavUserKey{}, userID)
+		ctx = context.WithValue(ctx, webdavContentLengthKey{}, r.ContentLength)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -99,6 +100,7 @@ type davFS struct {
 }
 
 type webdavUserKey struct{}
+type webdavContentLengthKey struct{}
 
 func (fs *davFS) userID(ctx context.Context) (int64, error) {
 	val := ctx.Value(webdavUserKey{})
@@ -239,7 +241,8 @@ func (fs *davFS) createUploadFile(ctx context.Context, userID int64, name string
 	if entry, err := fs.resolve(ctx, userID, name); err == nil && !entry.isDir {
 		existing = &entry.file
 	}
-	return newUploadFile(ctx, fs.tg, fs.store, userID, fs.storageChatID, parentDir.ID, base, existing, fs.maxPartSize), nil
+	contentLength, _ := ctx.Value(webdavContentLengthKey{}).(int64)
+	return newUploadFile(ctx, fs.tg, fs.store, userID, fs.storageChatID, parentDir.ID, base, existing, fs.maxPartSize, contentLength), nil
 }
 
 type davEntry struct {
@@ -596,17 +599,18 @@ type uploadFile struct {
 	parentDirID   int64
 	name          string
 	existing      *db.File
-	maxPartSize   int64
-	partIndex     int
-	totalSize     int64
-	parts         []db.FilePartInput
-	mimeType      string
-	current       *uploadPart
-	closed        bool
-	aborted       bool
-	abortErr      error
-	doneCh        chan struct{}
-	mu            sync.Mutex
+	maxPartSize    int64
+	splitFromStart bool
+	partIndex      int
+	totalSize      int64
+	parts          []db.FilePartInput
+	mimeType       string
+	current        *uploadPart
+	closed         bool
+	aborted        bool
+	abortErr       error
+	doneCh         chan struct{}
+	mu             sync.Mutex
 }
 
 type uploadPart struct {
@@ -621,10 +625,11 @@ type uploadResult struct {
 	err error
 }
 
-func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File, maxPartSize int64) *uploadFile {
+func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File, maxPartSize int64, contentLength int64) *uploadFile {
 	if maxPartSize <= 0 {
 		maxPartSize = 1900 * 1024 * 1024
 	}
+	splitFromStart := contentLength > maxPartSize
 	f := &uploadFile{
 		ctx:           ctx,
 		tg:            tg,
@@ -634,8 +639,9 @@ func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ow
 		parentDirID:   parentDirID,
 		name:          name,
 		existing:      existing,
-		maxPartSize:   maxPartSize,
-		doneCh:        make(chan struct{}),
+		maxPartSize:    maxPartSize,
+		splitFromStart: splitFromStart,
+		doneCh:         make(chan struct{}),
 	}
 	go f.watchContext()
 	return f
@@ -844,7 +850,7 @@ func (f *uploadFile) finishPart() error {
 }
 
 func (f *uploadFile) partFilename(index int) string {
-	if index == 0 {
+	if index == 0 && !f.splitFromStart {
 		return f.name
 	}
 	return fmt.Sprintf("%s.part%03d", f.name, index+1)
