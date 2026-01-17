@@ -82,6 +82,31 @@ func (s *Store) Migrate(ctx context.Context) error {
 			FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
 			UNIQUE(file_id, part_index)
 		);`,
+		`CREATE TABLE IF NOT EXISTS webdav_uploads (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			dir_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			total_size INTEGER NOT NULL DEFAULT 0,
+			uploaded_size INTEGER NOT NULL DEFAULT 0,
+			mime_type TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+			FOREIGN KEY(dir_id) REFERENCES directories(id) ON DELETE CASCADE,
+			UNIQUE(user_id, dir_id, name)
+		);`,
+		`CREATE TABLE IF NOT EXISTS webdav_upload_parts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			upload_id INTEGER NOT NULL,
+			part_index INTEGER NOT NULL,
+			telegram_file_id TEXT NOT NULL,
+			file_unique_id TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			FOREIGN KEY(upload_id) REFERENCES webdav_uploads(id) ON DELETE CASCADE,
+			UNIQUE(upload_id, part_index)
+		);`,
 		`CREATE TABLE IF NOT EXISTS shares (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			file_id INTEGER NOT NULL,
@@ -120,6 +145,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_username_lower ON user_profiles(username_lower);`,
 		`CREATE INDEX IF NOT EXISTS idx_webdav_credentials_user ON webdav_credentials(user_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_parts_file ON file_parts(file_id, part_index);`,
+		`CREATE INDEX IF NOT EXISTS idx_webdav_uploads_path ON webdav_uploads(user_id, dir_id, name);`,
+		`CREATE INDEX IF NOT EXISTS idx_webdav_upload_parts_upload ON webdav_upload_parts(upload_id, part_index);`,
 		`CREATE INDEX IF NOT EXISTS idx_shares_token ON shares(token);`,
 	}
 	for _, stmt := range statements {

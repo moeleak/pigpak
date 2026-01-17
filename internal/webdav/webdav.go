@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,16 @@ func (s *Server) wrapAuth(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), webdavUserKey{}, userID)
 		ctx = context.WithValue(ctx, webdavContentLengthKey{}, r.ContentLength)
+		if value := r.Header.Get("Content-Range"); value != "" {
+			cr, err := parseContentRange(value)
+			if err != nil {
+				http.Error(w, "invalid Content-Range", http.StatusBadRequest)
+				return
+			}
+			if cr.ok {
+				ctx = context.WithValue(ctx, webdavContentRangeKey{}, cr)
+			}
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -101,6 +112,14 @@ type davFS struct {
 
 type webdavUserKey struct{}
 type webdavContentLengthKey struct{}
+type webdavContentRangeKey struct{}
+
+type contentRange struct {
+	start int64
+	end   int64
+	total int64
+	ok    bool
+}
 
 func (fs *davFS) userID(ctx context.Context) (int64, error) {
 	val := ctx.Value(webdavUserKey{})
@@ -242,7 +261,12 @@ func (fs *davFS) createUploadFile(ctx context.Context, userID int64, name string
 		existing = &entry.file
 	}
 	contentLength, _ := ctx.Value(webdavContentLengthKey{}).(int64)
-	return newUploadFile(ctx, fs.tg, fs.store, userID, fs.storageChatID, parentDir.ID, base, existing, fs.maxPartSize, contentLength), nil
+	rangeInfo, _ := ctx.Value(webdavContentRangeKey{}).(contentRange)
+	file, err := newUploadFile(ctx, fs.tg, fs.store, userID, fs.storageChatID, parentDir.ID, base, existing, fs.maxPartSize, contentLength, rangeInfo)
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 type davEntry struct {
@@ -291,6 +315,60 @@ func splitPath(name string) ([]string, string) {
 		return nil, parts[0]
 	}
 	return parts[:len(parts)-1], parts[len(parts)-1]
+}
+
+func parseContentRange(value string) (contentRange, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return contentRange{}, nil
+	}
+	parts := strings.SplitN(value, " ", 2)
+	if len(parts) != 2 {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	if strings.ToLower(parts[0]) != "bytes" {
+		return contentRange{}, errors.New("unsupported Content-Range unit")
+	}
+	rangeParts := strings.SplitN(parts[1], "/", 2)
+	if len(rangeParts) != 2 {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	if rangeParts[0] == "*" {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	limits := strings.SplitN(rangeParts[0], "-", 2)
+	if len(limits) != 2 {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	start, err := strconv.ParseInt(limits[0], 10, 64)
+	if err != nil || start < 0 {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	end, err := strconv.ParseInt(limits[1], 10, 64)
+	if err != nil || end < start {
+		return contentRange{}, errors.New("invalid Content-Range")
+	}
+	total := int64(0)
+	if rangeParts[1] != "*" {
+		total, err = strconv.ParseInt(rangeParts[1], 10, 64)
+		if err != nil || total <= 0 || total <= end {
+			return contentRange{}, errors.New("invalid Content-Range")
+		}
+	}
+	return contentRange{start: start, end: end, total: total, ok: true}, nil
+}
+
+func inferTotalSize(cr contentRange, contentLength int64) int64 {
+	if cr.ok && cr.total > 0 {
+		return cr.total
+	}
+	if contentLength <= 0 {
+		return 0
+	}
+	if cr.ok && cr.start > 0 {
+		return cr.start + contentLength
+	}
+	return contentLength
 }
 
 type davFileInfo struct {
@@ -601,6 +679,7 @@ type uploadFile struct {
 	existing      *db.File
 	maxPartSize    int64
 	splitFromStart bool
+	uploadID       int64
 	partIndex      int
 	totalSize      int64
 	parts          []db.FilePartInput
@@ -625,11 +704,85 @@ type uploadResult struct {
 	err error
 }
 
-func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File, maxPartSize int64, contentLength int64) *uploadFile {
+type uploadSession struct {
+	id           int64
+	parts        []db.FilePartInput
+	uploadedSize int64
+	totalSize    int64
+	mimeType     string
+}
+
+func loadUploadSession(ctx context.Context, store *db.Store, userID, dirID int64, name string) (*uploadSession, error) {
+	upload, err := store.GetWebDAVUpload(ctx, userID, dirID, name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	parts, err := store.ListWebDAVUploadParts(ctx, upload.ID)
+	if err != nil {
+		return nil, err
+	}
+	inputs := make([]db.FilePartInput, 0, len(parts))
+	var uploadedSize int64
+	expectedIndex := 0
+	for _, part := range parts {
+		if part.PartIndex != expectedIndex {
+			return nil, fmt.Errorf("upload parts missing index %d: %w", expectedIndex, os.ErrInvalid)
+		}
+		inputs = append(inputs, db.FilePartInput{
+			PartIndex:      part.PartIndex,
+			TelegramFileID: part.TelegramFileID,
+			FileUniqueID:   part.FileUniqueID,
+			Size:           part.Size,
+		})
+		uploadedSize += part.Size
+		expectedIndex++
+	}
+	return &uploadSession{
+		id:           upload.ID,
+		parts:        inputs,
+		uploadedSize: uploadedSize,
+		totalSize:    upload.TotalSize,
+		mimeType:     upload.MimeType,
+	}, nil
+}
+
+func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ownerID, storageChatID, parentDirID int64, name string, existing *db.File, maxPartSize int64, contentLength int64, contentRange contentRange) (*uploadFile, error) {
 	if maxPartSize <= 0 {
 		maxPartSize = 1900 * 1024 * 1024
 	}
 	splitFromStart := contentLength > maxPartSize
+	session, err := loadUploadSession(ctx, store, ownerID, parentDirID, name)
+	if err != nil {
+		return nil, err
+	}
+	resumeRequested := contentRange.ok && contentRange.start > 0
+	if resumeRequested {
+		if session == nil {
+			return nil, fmt.Errorf("resume upload not found: %w", os.ErrNotExist)
+		}
+		if contentRange.start != session.uploadedSize {
+			return nil, fmt.Errorf("resume offset mismatch (expected %d at part %d): %w", session.uploadedSize, len(session.parts), os.ErrInvalid)
+		}
+		if totalSize := inferTotalSize(contentRange, contentLength); totalSize > 0 && totalSize != session.totalSize {
+			_ = store.UpdateWebDAVUploadTotal(ctx, session.id, totalSize)
+		}
+	} else {
+		if session != nil {
+			if err := store.DeleteWebDAVUpload(ctx, session.id); err != nil {
+				return nil, err
+			}
+			session = nil
+		}
+		totalSize := inferTotalSize(contentRange, contentLength)
+		created, err := store.CreateWebDAVUpload(ctx, ownerID, parentDirID, name, totalSize)
+		if err != nil {
+			return nil, err
+		}
+		session = &uploadSession{id: created.ID, totalSize: created.TotalSize}
+	}
 	f := &uploadFile{
 		ctx:           ctx,
 		tg:            tg,
@@ -641,10 +794,15 @@ func newUploadFile(ctx context.Context, tg *telegram.Client, store *db.Store, ow
 		existing:      existing,
 		maxPartSize:    maxPartSize,
 		splitFromStart: splitFromStart,
+		uploadID:       session.id,
+		partIndex:      len(session.parts),
+		totalSize:      session.uploadedSize,
+		parts:          append([]db.FilePartInput(nil), session.parts...),
+		mimeType:       session.mimeType,
 		doneCh:         make(chan struct{}),
 	}
 	go f.watchContext()
-	return f
+	return f, nil
 }
 
 func (f *uploadFile) Write(p []byte) (int, error) {
@@ -750,6 +908,7 @@ func (f *uploadFile) Close() error {
 	mimeType := f.mimeType
 	name := f.name
 	existing := f.existing
+	uploadID := f.uploadID
 	close(f.doneCh)
 	f.mu.Unlock()
 
@@ -757,15 +916,21 @@ func (f *uploadFile) Close() error {
 		return errors.New("empty upload")
 	}
 	first := parts[0]
+	var err error
 	if existing != nil {
-		return f.store.ReplaceFileWithParts(f.ctx, f.ownerID, existing.ID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
+		err = f.store.ReplaceFileWithParts(f.ctx, f.ownerID, existing.ID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
+	} else if len(parts) > 1 {
+		_, err = f.store.CreateFileWithParts(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
+	} else {
+		_, err = f.store.CreateFile(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType)
 	}
-	if len(parts) > 1 {
-		_, err := f.store.CreateFileWithParts(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType, parts)
+	if err != nil {
 		return err
 	}
-	_, err := f.store.CreateFile(f.ctx, f.ownerID, f.parentDirID, name, first.TelegramFileID, first.FileUniqueID, totalSize, mimeType)
-	return err
+	if uploadID != 0 {
+		_ = f.store.DeleteWebDAVUpload(f.ctx, uploadID)
+	}
+	return nil
 }
 
 func (f *uploadFile) Read(p []byte) (int, error) {
@@ -818,17 +983,21 @@ func (f *uploadFile) finishPart() error {
 	_ = part.pipeW.Close()
 	res := <-part.done
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.current == part {
 		f.current = nil
 	}
+	f.mu.Unlock()
 	if res.err != nil {
+		f.mu.Lock()
 		f.abortLocked(res.err)
+		f.mu.Unlock()
 		return res.err
 	}
 	if res.msg == nil || res.msg.Document == nil {
 		err := errors.New("telegram upload returned no document")
+		f.mu.Lock()
 		f.abortLocked(err)
+		f.mu.Unlock()
 		return err
 	}
 	doc := res.msg.Document
@@ -836,16 +1005,32 @@ func (f *uploadFile) finishPart() error {
 	if size == 0 {
 		size = part.size
 	}
-	f.parts = append(f.parts, db.FilePartInput{
+	partInput := db.FilePartInput{
 		PartIndex:      part.index,
 		TelegramFileID: doc.FileID,
 		FileUniqueID:   doc.FileUniqueID,
 		Size:           size,
-	})
+	}
+	if f.uploadID != 0 {
+		if err := f.store.AddWebDAVUploadPart(f.ctx, f.uploadID, db.WebDAVUploadPartInput{
+			PartIndex:      part.index,
+			TelegramFileID: doc.FileID,
+			FileUniqueID:   doc.FileUniqueID,
+			Size:           size,
+		}, doc.MimeType); err != nil {
+			f.mu.Lock()
+			f.abortLocked(err)
+			f.mu.Unlock()
+			return err
+		}
+	}
+	f.mu.Lock()
+	f.parts = append(f.parts, partInput)
 	if f.mimeType == "" && doc.MimeType != "" {
 		f.mimeType = doc.MimeType
 	}
 	f.partIndex++
+	f.mu.Unlock()
 	return nil
 }
 

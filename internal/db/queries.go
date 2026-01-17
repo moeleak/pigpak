@@ -56,6 +56,38 @@ type FilePartInput struct {
 	Size           int64
 }
 
+// WebDAVUpload tracks an in-progress WebDAV upload.
+type WebDAVUpload struct {
+	ID           int64
+	UserID       int64
+	DirID        int64
+	Name         string
+	TotalSize    int64
+	UploadedSize int64
+	MimeType     string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// WebDAVUploadPart represents a persisted upload part.
+type WebDAVUploadPart struct {
+	ID             int64
+	UploadID       int64
+	PartIndex      int
+	TelegramFileID string
+	FileUniqueID   string
+	Size           int64
+	CreatedAt      time.Time
+}
+
+// WebDAVUploadPartInput is used to insert upload parts.
+type WebDAVUploadPartInput struct {
+	PartIndex      int
+	TelegramFileID string
+	FileUniqueID   string
+	Size           int64
+}
+
 // Share represents a share link.
 type Share struct {
 	ID        int64
@@ -611,6 +643,114 @@ func insertFilePartsTx(ctx context.Context, tx *sql.Tx, fileID int64, parts []Fi
 			return err
 		}
 	}
+	return nil
+}
+
+// GetWebDAVUpload loads a WebDAV upload by name within a directory.
+func (s *Store) GetWebDAVUpload(ctx context.Context, userID, dirID int64, name string) (WebDAVUpload, error) {
+	var u WebDAVUpload
+	row := s.DB.QueryRowContext(ctx, `SELECT id, user_id, dir_id, name, total_size, uploaded_size, mime_type, created_at, updated_at FROM webdav_uploads WHERE user_id = ? AND dir_id = ? AND name = ?`, userID, dirID, name)
+	if err := row.Scan(&u.ID, &u.UserID, &u.DirID, &u.Name, &u.TotalSize, &u.UploadedSize, &u.MimeType, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		return u, err
+	}
+	return u, nil
+}
+
+// CreateWebDAVUpload inserts a new WebDAV upload session.
+func (s *Store) CreateWebDAVUpload(ctx context.Context, userID, dirID int64, name string, totalSize int64) (WebDAVUpload, error) {
+	if totalSize < 0 {
+		totalSize = 0
+	}
+	createdAt := now()
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO webdav_uploads(user_id, dir_id, name, total_size, uploaded_size, mime_type, created_at, updated_at) VALUES (?, ?, ?, ?, 0, '', ?, ?)`, userID, dirID, name, totalSize, createdAt, createdAt)
+	if err != nil {
+		return WebDAVUpload{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return WebDAVUpload{}, err
+	}
+	return WebDAVUpload{
+		ID:           id,
+		UserID:       userID,
+		DirID:        dirID,
+		Name:         name,
+		TotalSize:    totalSize,
+		UploadedSize: 0,
+		MimeType:     "",
+		CreatedAt:    createdAt,
+		UpdatedAt:    createdAt,
+	}, nil
+}
+
+// UpdateWebDAVUploadTotal updates the expected total size for an upload.
+func (s *Store) UpdateWebDAVUploadTotal(ctx context.Context, uploadID int64, totalSize int64) error {
+	if totalSize < 0 {
+		totalSize = 0
+	}
+	_, err := s.DB.ExecContext(ctx, `UPDATE webdav_uploads SET total_size = ?, updated_at = ? WHERE id = ?`, totalSize, now(), uploadID)
+	return err
+}
+
+// DeleteWebDAVUpload removes an upload session and its parts.
+func (s *Store) DeleteWebDAVUpload(ctx context.Context, uploadID int64) error {
+	_, err := s.DB.ExecContext(ctx, `DELETE FROM webdav_uploads WHERE id = ?`, uploadID)
+	return err
+}
+
+// ListWebDAVUploadParts returns the parts for a WebDAV upload ordered by index.
+func (s *Store) ListWebDAVUploadParts(ctx context.Context, uploadID int64) ([]WebDAVUploadPart, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, upload_id, part_index, telegram_file_id, file_unique_id, size, created_at FROM webdav_upload_parts WHERE upload_id = ? ORDER BY part_index`, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var parts []WebDAVUploadPart
+	for rows.Next() {
+		var p WebDAVUploadPart
+		if err := rows.Scan(&p.ID, &p.UploadID, &p.PartIndex, &p.TelegramFileID, &p.FileUniqueID, &p.Size, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		parts = append(parts, p)
+	}
+	return parts, rows.Err()
+}
+
+// AddWebDAVUploadPart stores a new part and updates upload progress.
+func (s *Store) AddWebDAVUploadPart(ctx context.Context, uploadID int64, part WebDAVUploadPartInput, mimeType string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	createdAt := now()
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO webdav_upload_parts(upload_id, part_index, telegram_file_id, file_unique_id, size, created_at) VALUES (?, ?, ?, ?, ?, ?)`, uploadID, part.PartIndex, part.TelegramFileID, part.FileUniqueID, part.Size, createdAt)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE webdav_uploads SET uploaded_size = uploaded_size + ?, updated_at = ? WHERE id = ?`, part.Size, createdAt, uploadID); err != nil {
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, `UPDATE webdav_uploads SET updated_at = ? WHERE id = ?`, createdAt, uploadID); err != nil {
+		return err
+	}
+	if mimeType != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE webdav_uploads SET mime_type = CASE WHEN mime_type = '' THEN ? ELSE mime_type END WHERE id = ?`, mimeType, uploadID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
