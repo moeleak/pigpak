@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -73,6 +74,30 @@ type UserState struct {
 	PendingTarget  sql.NullInt64
 	PendingPayload sql.NullString
 	UpdatedAt      time.Time
+}
+
+func nameConflictError() error {
+	return fmt.Errorf("name already exists: %w", os.ErrExist)
+}
+
+func (s *Store) ensureNameAvailable(ctx context.Context, userID, parentID int64, name string, excludeDirID, excludeFileID int64) error {
+	dir, err := s.GetDirByName(ctx, userID, parentID, name)
+	if err == nil {
+		if excludeDirID == 0 || dir.ID != excludeDirID {
+			return nameConflictError()
+		}
+	} else if err != sql.ErrNoRows {
+		return err
+	}
+	file, err := s.GetFileByName(ctx, userID, parentID, name)
+	if err == nil {
+		if excludeFileID == 0 || file.ID != excludeFileID {
+			return nameConflictError()
+		}
+	} else if err != sql.ErrNoRows {
+		return err
+	}
+	return nil
 }
 
 // EnsureUser inserts a user and root directory if missing.
@@ -269,6 +294,9 @@ func (s *Store) ListFiles(ctx context.Context, userID, dirID int64) ([]File, err
 
 // CreateDir creates a directory under parent.
 func (s *Store) CreateDir(ctx context.Context, userID, parentID int64, name string) (Directory, error) {
+	if err := s.ensureNameAvailable(ctx, userID, parentID, name, 0, 0); err != nil {
+		return Directory{}, err
+	}
 	res, err := s.DB.ExecContext(ctx, `INSERT INTO directories(user_id, parent_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, userID, parentID, name, now(), now())
 	if err != nil {
 		return Directory{}, err
@@ -282,6 +310,17 @@ func (s *Store) CreateDir(ctx context.Context, userID, parentID int64, name stri
 
 // RenameDir updates a directory name.
 func (s *Store) RenameDir(ctx context.Context, userID, dirID int64, name string) error {
+	dir, err := s.GetDirByID(ctx, userID, dirID)
+	if err != nil {
+		return err
+	}
+	parentID := int64(0)
+	if dir.ParentID.Valid {
+		parentID = dir.ParentID.Int64
+	}
+	if err := s.ensureNameAvailable(ctx, userID, parentID, name, dirID, 0); err != nil {
+		return err
+	}
 	res, err := s.DB.ExecContext(ctx, `UPDATE directories SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?`, name, now(), dirID, userID)
 	if err != nil {
 		return err
@@ -311,6 +350,13 @@ func (s *Store) MoveDir(ctx context.Context, userID, dirID, newParentID int64) e
 	}
 	if isDesc {
 		return errors.New("cannot move directory into its descendant")
+	}
+	dir, err := s.GetDirByID(ctx, userID, dirID)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureNameAvailable(ctx, userID, newParentID, dir.Name, dirID, 0); err != nil {
+		return err
 	}
 	res, err := s.DB.ExecContext(ctx, `UPDATE directories SET parent_id = ?, updated_at = ? WHERE id = ? AND user_id = ?`, newParentID, now(), dirID, userID)
 	if err != nil {
@@ -350,6 +396,9 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, userID, dirID int64) err
 
 // CreateFile inserts a file record.
 func (s *Store) CreateFile(ctx context.Context, userID, dirID int64, name, fileID, fileUniqueID string, size int64, mimeType string) (File, error) {
+	if err := s.ensureNameAvailable(ctx, userID, dirID, name, 0, 0); err != nil {
+		return File{}, err
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -366,6 +415,9 @@ func (s *Store) CreateFile(ctx context.Context, userID, dirID int64, name, fileI
 
 // CreateFileWithParts inserts a file and its parts.
 func (s *Store) CreateFileWithParts(ctx context.Context, userID, dirID int64, name, fileID, fileUniqueID string, size int64, mimeType string, parts []FilePartInput) (File, error) {
+	if err := s.ensureNameAvailable(ctx, userID, dirID, name, 0, 0); err != nil {
+		return File{}, err
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -402,6 +454,13 @@ func (s *Store) CreateFileWithParts(ctx context.Context, userID, dirID int64, na
 
 // ReplaceFileWithParts updates a file and replaces its parts.
 func (s *Store) ReplaceFileWithParts(ctx context.Context, userID, fileID int64, name, telegramFileID, fileUniqueID string, size int64, mimeType string, parts []FilePartInput) error {
+	file, err := s.GetFileByID(ctx, userID, fileID)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureNameAvailable(ctx, userID, file.DirID, name, 0, fileID); err != nil {
+		return err
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -477,6 +536,13 @@ func (s *Store) GetFileByName(ctx context.Context, userID, dirID int64, name str
 
 // RenameFile updates a file name.
 func (s *Store) RenameFile(ctx context.Context, userID, fileID int64, name string) error {
+	file, err := s.GetFileByID(ctx, userID, fileID)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureNameAvailable(ctx, userID, file.DirID, name, 0, fileID); err != nil {
+		return err
+	}
 	res, err := s.DB.ExecContext(ctx, `UPDATE files SET name = ? WHERE id = ? AND user_id = ?`, name, fileID, userID)
 	if err != nil {
 		return err
@@ -490,6 +556,13 @@ func (s *Store) RenameFile(ctx context.Context, userID, fileID int64, name strin
 
 // MoveFile moves a file to another directory.
 func (s *Store) MoveFile(ctx context.Context, userID, fileID, newDirID int64) error {
+	file, err := s.GetFileByID(ctx, userID, fileID)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureNameAvailable(ctx, userID, newDirID, file.Name, 0, fileID); err != nil {
+		return err
+	}
 	res, err := s.DB.ExecContext(ctx, `UPDATE files SET dir_id = ? WHERE id = ? AND user_id = ?`, newDirID, fileID, userID)
 	if err != nil {
 		return err
